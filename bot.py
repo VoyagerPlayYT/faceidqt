@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO)
 # ══════════════════════════════════════════════
 #  КОНФИГ — вставь свой токен в переменную окружения на Render
 # ══════════════════════════════════════════════
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬ_ТОКЕН_ЗДЕСЬ")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8669964430:AAHKJOjEBq5Lc9v8ItmW0dN4S-YvkV3ulwc")
 
 # Хранилище устройств: { device_uuid: { "chat_id": 123, "confirmed": True } }
 # В продакшене используй базу данных, для простоты — в памяти
