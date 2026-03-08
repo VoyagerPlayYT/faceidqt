@@ -13,7 +13,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8669964430:AAG9NAQGGpcU6fExwUPjVfzvAOcYvT4eeTM")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 # devices[uuid] = {"chat_id": 123, "name": "PC"}
 # pending[uuid] = {"chat_id": 123, "code": "123456", "time": 000}
@@ -27,14 +27,16 @@ commands = {}  # команды ожидающие выполнения ПК
 # ══════════════════════════════════════════════
 def main_keyboard(uuid):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📸 Скриншот экрана", callback_data=f"screenshot|{uuid}"),
-         InlineKeyboardButton("📷 Фото с камеры",   callback_data=f"camera|{uuid}")],
-        [InlineKeyboardButton("🔒 Заблокировать ПК", callback_data=f"lock|{uuid}"),
-         InlineKeyboardButton("🔄 Перезагрузить",    callback_data=f"reboot|{uuid}")],
-        [InlineKeyboardButton("⏻ Выключить ПК",      callback_data=f"shutdown|{uuid}"),
-         InlineKeyboardButton("🎥 Эфир (5 кадров)",  callback_data=f"stream|{uuid}")],
-        [InlineKeyboardButton("🔐 Запросить пароль", callback_data=f"askpass|{uuid}"),
+        [InlineKeyboardButton("📸 Скриншот",         callback_data=f"screenshot|{uuid}"),
+         InlineKeyboardButton("📷 Камера",           callback_data=f"camera|{uuid}"),
+         InlineKeyboardButton("🎥 Эфир",             callback_data=f"stream|{uuid}")],
+        [InlineKeyboardButton("🔒 Заблокировать",    callback_data=f"lock|{uuid}"),
+         InlineKeyboardButton("🔐 Face ID запрос",   callback_data=f"faceid|{uuid}"),
          InlineKeyboardButton("📊 Статус",           callback_data=f"status|{uuid}")],
+        [InlineKeyboardButton("📱 Приложения",       callback_data=f"listapps|{uuid}"),
+         InlineKeyboardButton("📁 Файлы",            callback_data=f"files|{uuid}")],
+        [InlineKeyboardButton("🔄 Перезагрузить",    callback_data=f"reboot|{uuid}"),
+         InlineKeyboardButton("⏻ Выключить",         callback_data=f"shutdown|{uuid}")],
     ])
 
 # ══════════════════════════════════════════════
@@ -114,10 +116,23 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    parts = data.split("|")
-    if len(parts) != 2:
+    # launchapp имеет формат "launchapp:N|uuid"
+    if "|" in data:
+        parts = data.split("|")
+        if len(parts) != 2:
+            return
+        cmd, uuid = parts
+    else:
         return
-    cmd, uuid = parts
+
+    # Запуск конкретного приложения
+    if cmd.startswith("launchapp:"):
+        if uuid not in devices or devices[uuid]["chat_id"] != chat_id:
+            await query.answer("❌ Нет доступа", show_alert=True)
+            return
+        commands[uuid] = {"cmd": cmd, "time": datetime.now().timestamp()}
+        await query.answer("▶️ Запускаю...")
+        return
 
     # Проверяем права
     if uuid not in devices or devices[uuid]["chat_id"] != chat_id:
@@ -127,16 +142,35 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Ставим команду в очередь для ПК
     commands[uuid] = {"cmd": cmd, "time": datetime.now().timestamp()}
 
+    # Специальные команды — список приложений и файлы
+    if cmd == "listapps":
+        commands[uuid] = {"cmd": "listapps", "time": datetime.now().timestamp()}
+        await query.edit_message_text("📱 Загружаю список приложений...",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"select|{uuid}")]]))
+        return
+
+    if cmd == "files":
+        await query.edit_message_text(
+            "📁 *Передача файлов*\n\n"
+            "Отправь команду:\n`/getfile UUID путь\\к\\файлу`\n\n"
+            "Например:\n`/getfile "+uuid+" C:\\Users\\User\\Desktop\\photo.jpg`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"select|{uuid}")]])
+        )
+        return
+
     cmd_names = {
         "screenshot": "📸 Запрос скриншота отправлен...",
         "camera":     "📷 Запрос фото с камеры...",
         "lock":       "🔒 Команда блокировки отправлена...",
         "reboot":     "🔄 Команда перезагрузки отправлена...",
         "shutdown":   "⏻ Команда выключения отправлена...",
-        "stream":     "🎥 Запрос прямого эфира...",
+        "stream":     "🎥 Запрос прямого эфира (5 кадров)...",
         "askpass":    "🔐 Запрос пароля отправлен на ПК...",
         "status":     "📊 Запрос статуса...",
+        "faceid":     "🔐 Запрос Face ID отправлен на ПК...",
     }
+    commands[uuid] = {"cmd": cmd, "time": datetime.now().timestamp()}
     await query.edit_message_text(
         cmd_names.get(cmd, "Команда отправлена..."),
         reply_markup=InlineKeyboardMarkup([[
@@ -235,6 +269,23 @@ async def api_poll(request):
     
     return web.json_response({"cmd": cmd["cmd"]})
 
+async def getfile_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Запрос файла с ПК: /getfile UUID путь"""
+    if len(ctx.args) < 2:
+        await update.message.reply_text("❌ Формат: /getfile UUID путь\\к\\файлу")
+        return
+    dev_uuid = ctx.args[0].strip()
+    filepath = " ".join(ctx.args[1:]).strip()
+    chat_id  = update.effective_chat.id
+
+    if dev_uuid not in devices or devices[dev_uuid]["chat_id"] != chat_id:
+        await update.message.reply_text("❌ Устройство не найдено или нет доступа.")
+        return
+
+    commands[dev_uuid] = {"cmd": f"sendfile:{filepath}", "time": datetime.now().timestamp()}
+    await update.message.reply_text(f"📁 Запрашиваю файл:\n`{filepath}`", parse_mode="Markdown")
+
+
 async def api_result(request):
     """ПК отправляет результат команды (скриншот, камера и т.д.)"""
     try:
@@ -276,6 +327,48 @@ async def api_result(request):
     elif cmd == "locked":
         await bot_app.bot.send_message(chat_id, "🔒 ПК заблокирован",
             reply_markup=main_keyboard(dev_uuid))
+
+    elif cmd == "file":
+        filename = data.get("filename", "file.bin")
+        b64data  = data.get("image","")
+        if b64data:
+            file_bytes = base64.b64decode(b64data)
+            await bot_app.bot.send_document(
+                chat_id,
+                document=file_bytes,
+                filename=filename,
+                caption=f"📁 {filename}"
+            )
+        else:
+            await bot_app.bot.send_message(chat_id, "❌ Файл пустой или не найден")
+
+    elif cmd == "file_error":
+        errors = {"no_path":"Путь не указан","not_found":"Файл не найден","too_large":"Файл >50MB"}
+        err = data.get("error","unknown")
+        await bot_app.bot.send_message(chat_id, f"❌ Ошибка: {errors.get(err,err)}")
+
+    elif cmd == "apps_list":
+        apps = data.get("apps", [])
+        if not apps:
+            await bot_app.bot.send_message(chat_id, "📱 Нет добавленных приложений.")
+            return web.json_response({"ok": True})
+        kb = []
+        for app in apps:
+            kb.append([InlineKeyboardButton(
+                f"▶️ {app['name']}",
+                callback_data=f"launchapp:{app['idx']}|{dev_uuid}"
+            )])
+        kb.append([InlineKeyboardButton("◀️ Назад", callback_data=f"select|{dev_uuid}")])
+        await bot_app.bot.send_message(
+            chat_id, "📱 *Выбери приложение для запуска:*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+    elif cmd == "app_launched":
+        name = data.get("name","?")
+        await bot_app.bot.send_message(chat_id, f"▶️ Запущено: *{name}*",
+            parse_mode="Markdown", reply_markup=main_keyboard(dev_uuid))
     
     return web.json_response({"ok": True})
 
@@ -302,6 +395,7 @@ async def main():
     bot_app.add_handler(CommandHandler("register",register_cmd))
     bot_app.add_handler(CommandHandler("devices", devices_cmd))
     bot_app.add_handler(CommandHandler("control", control_cmd))
+    bot_app.add_handler(CommandHandler("getfile", getfile_cmd))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
 
     await bot_app.initialize()
