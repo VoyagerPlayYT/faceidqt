@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8669964430:AAG9NAQGGpcU6fExwUPjVfzvAOcYvT4eeTM")
 
 # devices[uuid] = {"chat_id": 123}
 # pending[uuid] = {"chat_id": 123, "code": "123456", "time": 000}
