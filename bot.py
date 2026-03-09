@@ -100,6 +100,107 @@ async def control_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb = [[InlineKeyboardButton(d.get("name",u[:8]), callback_data=f"select|{u}")] for u,d in my]
         await update.message.reply_text("Выбери устройство:", reply_markup=InlineKeyboardMarkup(kb))
 
+# ══════════════════════════════════════════
+#  ФАЙЛОВЫЙ МЕНЕДЖЕР
+# ══════════════════════════════════════════
+import urllib.parse
+
+QUICK_FOLDERS = [
+    ("🖥️ Рабочий стол",  "DESKTOP"),
+    ("📥 Загрузки",       "DOWNLOADS"),
+    ("📄 Документы",      "DOCUMENTS"),
+    ("🖼️ Изображения",    "PICTURES"),
+    ("🎵 Музыка",         "MUSIC"),
+    ("🎬 Видео",          "VIDEOS"),
+    ("💾 Диск C:",        "C:"),
+    ("💾 Диск D:",        "D:"),
+]
+
+file_results  = {}   # uuid -> listdir result from PC
+file_sessions = {}   # uuid -> current path
+
+def get_file_icon(name):
+    ext = name.rsplit(".",1)[-1].lower() if "." in name else ""
+    m = {"jpg":"🖼️","jpeg":"🖼️","png":"🖼️","gif":"🖼️","bmp":"🖼️","webp":"🖼️",
+         "mp4":"🎬","avi":"🎬","mkv":"🎬","mov":"🎬","mp3":"🎵","wav":"🎵",
+         "flac":"🎵","m4a":"🎵","pdf":"📕","doc":"📝","docx":"📝","txt":"📄",
+         "xlsx":"📊","pptx":"📊","zip":"🗜️","rar":"🗜️","7z":"🗜️",
+         "exe":"⚙️","msi":"⚙️","py":"🐍","cpp":"💻","js":"💻","html":"🌐"}
+    return m.get(ext,"📄")
+
+async def show_file_browser(query, uuid, path, edit=True):
+    if path == "root":
+        kb = []
+        for label, key in QUICK_FOLDERS:
+            safe = urllib.parse.quote(key, safe="")
+            kb.append([InlineKeyboardButton(label, callback_data=f"browse:{safe}|{uuid}")])
+        kb.append([InlineKeyboardButton("◀️ Назад", callback_data=f"select|{uuid}")])
+        text = "📁 *Файловый менеджер*\nВыбери папку:"
+        if edit:
+            await query.edit_message_text(text, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await query.message.reply_text(text, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    # Запрашиваем содержимое у ПК
+    decoded = urllib.parse.unquote(path)
+    commands[uuid] = {"cmd": f"listdir:{decoded}", "time": datetime.now().timestamp()}
+
+    # Ждём ответа до 8 сек
+    for _ in range(16):
+        await asyncio.sleep(0.5)
+        if uuid in file_results:
+            break
+
+    result = file_results.pop(uuid, None)
+    if not result:
+        kb = [[InlineKeyboardButton("📁 Корень", callback_data=f"files|{uuid}"),
+               InlineKeyboardButton("◀️ Назад",  callback_data=f"select|{uuid}")]]
+        await query.edit_message_text("⏳ ПК не ответил или папка недоступна.",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    entries = result.get("entries",[])
+    folders = [e for e in entries if e["type"]=="dir"]
+    files   = [e for e in entries if e["type"]=="file"]
+    kb = []
+
+    # Кнопка назад
+    if "\\" in decoded and decoded not in ("C:\\","D:\\","E:\\"):
+        parent = decoded.rsplit("\\",1)[0]
+        if not parent.endswith(":"): pass
+        else: parent = parent + "\\"
+        safe_p = urllib.parse.quote(parent, safe="")
+        kb.append([InlineKeyboardButton("⬆️ Наверх (..) ", callback_data=f"browse:{safe_p}|{uuid}")])
+    else:
+        kb.append([InlineKeyboardButton("📁 Быстрые папки", callback_data=f"files|{uuid}")])
+
+    for e in folders[:18]:
+        full = decoded.rstrip("\\") + "\\" + e["name"]
+        safe = urllib.parse.quote(full, safe="")
+        kb.append([InlineKeyboardButton(f"📁 {e['name']}", callback_data=f"browse:{safe}|{uuid}")])
+
+    for e in files[:15]:
+        full = decoded.rstrip("\\") + "\\" + e["name"]
+        safe = urllib.parse.quote(full, safe="")
+        kb_val = e.get('size_kb',0)
+        sz = f" {kb_val}KB" if kb_val < 10240 else f" {kb_val//1024}MB"
+        icon = get_file_icon(e["name"])
+        kb.append([InlineKeyboardButton(
+            f"{icon} {e['name']}{sz}",
+            callback_data=f"dlfile:{safe}|{uuid}"
+        )])
+
+    short = decoded[-40:] if len(decoded)>40 else decoded
+    text = (f"📁 `{short}`\n\n"
+            f"{'📂 '+str(len(folders))+' папок   ' if folders else ''}"
+            f"{'📄 '+str(len(files))+' файлов' if files else ''}"
+            f"{chr(10)+'(показаны первые 15)' if len(files)>15 else ''}")
+    await query.edit_message_text(text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb))
+
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -123,6 +224,26 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         cmd, uuid = parts
     else:
+        return
+
+    # Навигация по файлам
+    if cmd.startswith("browse:"):
+        path = cmd[7:]  # убираем "browse:"
+        await show_file_browser(query, uuid, path)
+        return
+
+    # Скачать файл
+    if cmd.startswith("dlfile:"):
+        filepath = urllib.parse.unquote(cmd[7:])
+        commands[uuid] = {"cmd": f"sendfile:{filepath}", "time": datetime.now().timestamp()}
+        name = filepath.rsplit("\\",1)[-1]
+        await query.edit_message_text(
+            f"📥 Скачиваю `{name}`...",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Назад", callback_data=f"files|{uuid}")
+            ]])
+        )
         return
 
     # Запуск конкретного приложения
@@ -150,13 +271,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if cmd == "files":
-        await query.edit_message_text(
-            "📁 *Передача файлов*\n\n"
-            "Отправь команду:\n`/getfile UUID путь\\к\\файлу`\n\n"
-            "Например:\n`/getfile "+uuid+" C:\\Users\\User\\Desktop\\photo.jpg`",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"select|{uuid}")]])
-        )
+        await show_file_browser(query, uuid, "root")
         return
 
     cmd_names = {
@@ -341,6 +456,10 @@ async def api_result(request):
             )
         else:
             await bot_app.bot.send_message(chat_id, "❌ Файл пустой или не найден")
+
+    elif cmd == "listdir":
+        # ПК прислал список файлов — сохраняем для file browser
+        file_results[dev_uuid] = data
 
     elif cmd == "file_error":
         errors = {"no_path":"Путь не указан","not_found":"Файл не найден","too_large":"Файл >50MB"}
