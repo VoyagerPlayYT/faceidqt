@@ -6,37 +6,50 @@ Face ID Protector Bot v3
 """
 import os, json, asyncio, logging, base64, random, time, urllib.parse
 from datetime import datetime
-from pathlib import Path
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8669964430:AAG9NAQGGpcU6fExwUPjVfzvAOcYvT4eeTM")
-DATA_FILE = "/tmp/faceid_data.json"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+# ══════════════════════════════════════════════
+#  ХРАНИЛИЩЕ (JSONBin.io — персистентное)
+# ══════════════════════════════════════════════
+import aiohttp as aiohttp_lib
 
-# ══════════════════════════════════════════════
-#  ХРАНИЛИЩЕ (персистентное)
-# ══════════════════════════════════════════════
-def load_data():
+JSONBIN_ID  = os.environ.get("JSONBIN_ID",  "")
+JSONBIN_KEY = os.environ.get("JSONBIN_KEY", "")
+JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_ID}"
+
+async def load_data_remote():
+    if not JSONBIN_ID or not JSONBIN_KEY:
+        return {"devices": {}, "pending": {}}
     try:
-        if Path(DATA_FILE).exists():
-            with open(DATA_FILE,'r') as f:
-                return json.load(f)
-    except: pass
+        async with aiohttp_lib.ClientSession() as s:
+            async with s.get(JSONBIN_URL+"/latest",
+                headers={"X-Master-Key": JSONBIN_KEY}) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    return d.get("record", {"devices":{},"pending":{}})
+    except Exception as e:
+        logging.error(f"Load error: {e}")
     return {"devices": {}, "pending": {}}
 
-def save_data():
+async def await save_data():
+    if not JSONBIN_ID or not JSONBIN_KEY:
+        return
     try:
-        with open(DATA_FILE,'w') as f:
-            json.dump({"devices": devices, "pending": pending}, f)
+        async with aiohttp_lib.ClientSession() as s:
+            await s.put(JSONBIN_URL,
+                headers={"X-Master-Key": JSONBIN_KEY,
+                         "Content-Type": "application/json"},
+                json={"devices": devices, "pending": pending})
     except Exception as e:
         logging.error(f"Save error: {e}")
 
-_d = load_data()
-devices  = _d.get("devices",  {})   # uuid -> {chat_id, name}
-pending  = _d.get("pending",  {})   # uuid -> {chat_id, code, time}
+devices  = {}
+pending  = {}
 commands     = {}   # uuid -> {cmd, time}
 file_results = {}   # uuid -> listdir result
 stream_frames= {}   # uuid -> list of base64 frames
@@ -165,7 +178,7 @@ async def register_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id  = update.effective_chat.id
     code     = str(random.randint(100000, 999999))
     pending[dev_uuid] = {"chat_id": chat_id, "code": code, "time": time.time()}
-    save_data()
+    await save_data()
     await update.message.reply_text(
         f"📱 *Подтверждение устройства*\n\n"
         f"UUID: `{dev_uuid[:8]}...`\n\n"
@@ -303,13 +316,13 @@ async def api_verify(request):
         return web.json_response({"ok":False,"error":"not_found"})
     p = pending[dev_uuid]
     if time.time() - p["time"] > 600:
-        del pending[dev_uuid]; save_data()
+        del pending[dev_uuid]; await save_data()
         return web.json_response({"ok":False,"error":"expired"})
     if p["code"] != code:
         return web.json_response({"ok":False,"error":"wrong_code"})
     devices[dev_uuid] = {"chat_id": p["chat_id"], "name": data.get("name","ПК")}
     del pending[dev_uuid]
-    save_data()
+    await save_data()
     await bot_app.bot.send_message(
         p["chat_id"],
         f"✅ *Устройство привязано!*\nUUID: `{dev_uuid[:8]}...`\n\nИспользуй /control",
@@ -637,6 +650,13 @@ async def main():
     bot_app.add_handler(CommandHandler("control",  control_cmd))
     bot_app.add_handler(CommandHandler("getfile",  getfile_cmd))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
+
+    # Загружаем данные из JSONBin
+    global devices, pending
+    loaded = await load_data_remote()
+    devices = loaded.get("devices", {})
+    pending = loaded.get("pending", {})
+    logging.info(f"Loaded {len(devices)} devices from storage")
 
     await bot_app.initialize()
     await bot_app.start()
