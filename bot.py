@@ -12,11 +12,11 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8669964430:AAG9NAQGGpcU6fExwUPjVfzvAOcYvT4eeTM")
 # ══════════════════════════════════════════════
 #  ХРАНИЛИЩЕ (JSONBin.io — персистентное)
 # ══════════════════════════════════════════════
-import aiohttp as aiohttp_lib
+import aiohttp
 
 JSONBIN_ID  = os.environ.get("JSONBIN_ID",  "")
 JSONBIN_KEY = os.environ.get("JSONBIN_KEY", "")
@@ -26,7 +26,7 @@ async def load_data_remote():
     if not JSONBIN_ID or not JSONBIN_KEY:
         return {"devices": {}, "pending": {}}
     try:
-        async with aiohttp_lib.ClientSession() as s:
+        async with aiohttp.ClientSession() as s:
             async with s.get(JSONBIN_URL+"/latest",
                 headers={"X-Master-Key": JSONBIN_KEY}) as r:
                 if r.status == 200:
@@ -36,11 +36,11 @@ async def load_data_remote():
         logging.error(f"Load error: {e}")
     return {"devices": {}, "pending": {}}
 
-async def await save_data():
+async def save_data():
     if not JSONBIN_ID or not JSONBIN_KEY:
         return
     try:
-        async with aiohttp_lib.ClientSession() as s:
+        async with aiohttp.ClientSession() as s:
             await s.put(JSONBIN_URL,
                 headers={"X-Master-Key": JSONBIN_KEY,
                          "Content-Type": "application/json"},
