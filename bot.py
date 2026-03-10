@@ -12,11 +12,11 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8669964430:AAG9NAQGGpcU6fExwUPjVfzvAOcYvT4eeTM")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # ══════════════════════════════════════════════
 #  ХРАНИЛИЩЕ (JSONBin.io — персистентное)
 # ══════════════════════════════════════════════
-import aiohttp
+import aiohttp as aiohttp_lib
 
 JSONBIN_ID  = os.environ.get("JSONBIN_ID",  "")
 JSONBIN_KEY = os.environ.get("JSONBIN_KEY", "")
@@ -26,7 +26,7 @@ async def load_data_remote():
     if not JSONBIN_ID or not JSONBIN_KEY:
         return {"devices": {}, "pending": {}}
     try:
-        async with aiohttp.ClientSession() as s:
+        async with aiohttp_lib.ClientSession() as s:
             async with s.get(JSONBIN_URL+"/latest",
                 headers={"X-Master-Key": JSONBIN_KEY}) as r:
                 if r.status == 200:
@@ -36,11 +36,11 @@ async def load_data_remote():
         logging.error(f"Load error: {e}")
     return {"devices": {}, "pending": {}}
 
-async def save_data():
+async def await save_data():
     if not JSONBIN_ID or not JSONBIN_KEY:
         return
     try:
-        async with aiohttp.ClientSession() as s:
+        async with aiohttp_lib.ClientSession() as s:
             await s.put(JSONBIN_URL,
                 headers={"X-Master-Key": JSONBIN_KEY,
                          "Content-Type": "application/json"},
@@ -171,19 +171,29 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def register_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     if not ctx.args:
-        await update.message.reply_text("❌ Укажи UUID:\n`/register ВАШ-UUID`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "📱 *Привязка устройства*\n\n"
+            "1️⃣ Открой приложение FaceID Protector\n"
+            "2️⃣ Нажми кнопку ✈️ *Telegram*\n"
+            "3️⃣ Скопируй UUID который покажет приложение\n"
+            "4️⃣ Отправь сюда:\n\n"
+            "`/register ВАШ-UUID`\n\n"
+            "Например:\n"
+            "`/register 7b23db80-b356-4a86-b32b-84a40e643706`",
+            parse_mode="Markdown"
+        )
         return
     dev_uuid = ctx.args[0].strip()
-    chat_id  = update.effective_chat.id
     code     = str(random.randint(100000, 999999))
     pending[dev_uuid] = {"chat_id": chat_id, "code": code, "time": time.time()}
     await save_data()
     await update.message.reply_text(
         f"📱 *Подтверждение устройства*\n\n"
         f"UUID: `{dev_uuid[:8]}...`\n\n"
-        f"Введи этот код в приложении:\n"
-        f"*{code}*\n\n"
+        f"Введи этот код в приложении FaceID:\n\n"
+        f"🔑 *{code}*\n\n"
         f"⏱ Код действителен 10 минут.",
         parse_mode="Markdown"
     )
