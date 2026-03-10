@@ -12,7 +12,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8669964430:AAEnawN7vnTr341dHx00fTTZ-iiakSlXS14")
 # ══════════════════════════════════════════════
 #  ХРАНИЛИЩЕ (JSONBin.io — персистентное)
 # ══════════════════════════════════════════════
