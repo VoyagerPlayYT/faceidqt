@@ -36,7 +36,7 @@ async def load_data_remote():
         logging.error(f"Load error: {e}")
     return {"devices": {}, "pending": {}}
 
-async def await save_data():
+async def save_data():
     if not JSONBIN_ID or not JSONBIN_KEY:
         return
     try:
