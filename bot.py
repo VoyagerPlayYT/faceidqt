@@ -1,5 +1,5 @@
 """
-Face ID Protector Bot v5
+Face ID Protector Bot v5 — ПОЛНАЯ ВЕРСИЯ
 + 2FA через Telegram
 + Диспетчер задач (процессы + kill)
 + Режим Паника
@@ -12,6 +12,7 @@ Face ID Protector Bot v5
 + Мониторинг CPU/RAM в веб-панели
 + WebSocket прямой эфир
 """
+
 import os, json, asyncio, logging, base64, random, time, urllib.parse, string
 from datetime import datetime
 from aiohttp import web
@@ -19,47 +20,63 @@ import aiohttp as aiohttp_lib
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
+# ══════════════════════════════════════════════════
+#  КОНФИГУРАЦИЯ
+# ══════════════════════════════════════════════════
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "8669964430:AAGQI6ZlTv_MUlo50s3j9rplbM_Rfi6GfFo")
 JSONBIN_ID  = os.environ.get("JSONBIN_ID",  "")
 JSONBIN_KEY = os.environ.get("JSONBIN_KEY", "")
 JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_ID}"
 
-# ══════════════════════════════════════════════
+logger.info(f"Bot starting with token: {BOT_TOKEN[:20]}...")
+logger.info(f"JSONBIN configured: {bool(JSONBIN_ID)}")
+
+# ══════════════════════════════════════════════════
 #  ХРАНИЛИЩЕ
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 async def load_data_remote():
+    """Загружает данные с JsonBin"""
     if not JSONBIN_ID or not JSONBIN_KEY:
+        logger.warning("JSONBIN not configured, using in-memory storage")
         return {"devices": {}, "pending": {}}
     try:
         async with aiohttp_lib.ClientSession() as s:
-            async with s.get(JSONBIN_URL+"/latest",
-                headers={"X-Master-Key": JSONBIN_KEY}) as r:
+            async with s.get(JSONBIN_URL + "/latest",
+                headers={"X-Master-Key": JSONBIN_KEY}, timeout=aiohttp_lib.ClientTimeout(total=10)) as r:
                 if r.status == 200:
                     d = await r.json()
-                    return d.get("record", {"devices":{},"pending":{}})
+                    logger.info(f"Loaded data: {len(d.get('record', {}).get('devices', {}))} devices")
+                    return d.get("record", {"devices": {}, "pending": {}})
     except Exception as e:
-        logging.error(f"Load error: {e}")
+        logger.error(f"Load error: {e}")
     return {"devices": {}, "pending": {}}
 
 async def save_data():
+    """Сохраняет данные в JsonBin"""
     if not JSONBIN_ID or not JSONBIN_KEY:
         return
     try:
         async with aiohttp_lib.ClientSession() as s:
             await s.put(JSONBIN_URL,
                 headers={"X-Master-Key": JSONBIN_KEY, "Content-Type": "application/json"},
-                json={"devices": devices, "pending": pending})
+                json={"devices": devices, "pending": pending},
+                timeout=aiohttp_lib.ClientTimeout(total=10))
+        logger.debug("Data saved to JSONBIN")
     except Exception as e:
-        logging.error(f"Save error: {e}")
+        logger.error(f"Save error: {e}")
 
-devices       = {}
-used_tokens   = set()  # одноразовые токены (in-memory)
-pending       = {}
-commands      = {}
-file_results  = {}
-last_images   = {}
+# ══════════════════════════════════════════════════
+#  ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+# ══════════════════════════════════════════════════
+devices       = {}      # uuid -> {chat_id, name, time}
+used_tokens   = set()   # одноразовые токены (in-memory)
+pending       = {}      # uuid -> {token, name, time, chat_id, verify_code}
+commands      = {}      # uuid -> {cmd, time}
+file_results  = {}      # uuid -> {entries, path}
+last_images   = {}      # uuid -> {screenshot, camera}
 ws_clients    = {}      # uuid -> set of websockets
 tfa_codes     = {}      # uuid -> {code, chat_id, time}
 search_results= {}      # uuid -> list
@@ -70,10 +87,11 @@ usb_blocked   = {}      # uuid -> bool
 autoscr_tasks = {}      # uuid -> asyncio.Task
 sysmon_data   = {}      # uuid -> {cpu, ram, time}
 
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 #  КЛАВИАТУРЫ
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 def main_keyboard(uuid):
+    """Основная клавиатура управления"""
     usb_label = "🔌 USB разблокировать" if usb_blocked.get(uuid) else "🔌 USB заблокировать"
     autoscr_label = "⏹ Авто-скрин СТОП" if uuid in autoscr_tasks else "📷 Авто-скрин"
     return InlineKeyboardMarkup([
@@ -110,28 +128,48 @@ def confirm_delete_keyboard(uuid):
 def back_keyboard(uuid):
     return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"select|{uuid}")]])
 
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+#  УТИЛИТЫ
+# ══════════════════════════════════════════════════
+def generate_verify_code(length=16):
+    """Генерирует 16-символьный код верификации"""
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.SystemRandom().choice(chars) for _ in range(length))
+
+# ══════════════════════════════════════════════════
 #  ФАЙЛОВЫЙ МЕНЕДЖЕР
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 QUICK_FOLDERS = [
-    ("🖥️ Рабочий стол", "DESKTOP"), ("📥 Загрузки", "DOWNLOADS"),
-    ("📄 Документы",     "DOCUMENTS"), ("🖼️ Изображения", "PICTURES"),
-    ("🎵 Музыка",        "MUSIC"), ("🎬 Видео", "VIDEOS"),
-    ("💾 Диск C:",       "C:"), ("💾 Диск D:", "D:"),
+    ("🖥️ Рабочий стол", "DESKTOP"),
+    ("📥 Загрузки", "DOWNLOADS"),
+    ("📄 Документы", "DOCUMENTS"),
+    ("🖼️ Изображения", "PICTURES"),
+    ("🎵 Музыка", "MUSIC"),
+    ("🎬 Видео", "VIDEOS"),
+    ("💾 Диск C:", "C:"),
+    ("💾 Диск D:", "D:"),
 ]
 
 def get_file_icon(name):
-    ext = name.rsplit(".",1)[-1].lower() if "." in name else ""
-    m = {"jpg":"🖼️","jpeg":"🖼️","png":"🖼️","gif":"🖼️","mp4":"🎬","avi":"🎬",
-         "mkv":"🎬","mp3":"🎵","wav":"🎵","flac":"🎵","pdf":"📕","doc":"📝",
-         "docx":"📝","txt":"📄","xlsx":"📊","zip":"🗜️","rar":"🗜️","7z":"🗜️",
-         "exe":"⚙️","msi":"⚙️","py":"🐍","cpp":"💻","js":"💻","html":"🌐"}
+    """Возвращает иконку для файла"""
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    m = {
+        "jpg": "🖼️", "jpeg": "🖼️", "png": "🖼️", "gif": "🖼️",
+        "mp4": "🎬", "avi": "🎬", "mkv": "🎬",
+        "mp3": "🎵", "wav": "🎵", "flac": "🎵",
+        "pdf": "📕", "doc": "📝", "docx": "📝",
+        "txt": "📄", "xlsx": "📊", "zip": "🗜️",
+        "rar": "🗜️", "7z": "🗜️",
+        "exe": "⚙️", "msi": "⚙️",
+        "py": "🐍", "cpp": "💻", "js": "💻", "html": "🌐"
+    }
     return m.get(ext, "📄")
 
 async def show_file_browser(query, uuid, path):
+    """Показывает файловый браузер"""
     if path == "root":
-        kb = [[InlineKeyboardButton(label, callback_data=f"browse:{urllib.parse.quote(key,safe='')}|{uuid}")]
-              for label,key in QUICK_FOLDERS]
+        kb = [[InlineKeyboardButton(label, callback_data=f"browse:{urllib.parse.quote(key, safe='')}|{uuid}")]
+              for label, key in QUICK_FOLDERS]
         kb.append([InlineKeyboardButton("◀️ Назад", callback_data=f"select|{uuid}")])
         await query.edit_message_text("📁 *Файловый менеджер*\nВыбери папку:",
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
@@ -141,7 +179,8 @@ async def show_file_browser(query, uuid, path):
     commands[uuid] = {"cmd": f"listdir:{decoded}", "time": time.time()}
     for _ in range(20):
         await asyncio.sleep(0.5)
-        if uuid in file_results: break
+        if uuid in file_results:
+            break
 
     result = file_results.pop(uuid, None)
     if not result:
@@ -152,42 +191,52 @@ async def show_file_browser(query, uuid, path):
         return
 
     entries = result.get("entries", [])
-    folders = [e for e in entries if e["type"]=="dir"]
-    files   = [e for e in entries if e["type"]=="file"]
+    folders = [e for e in entries if e["type"] == "dir"]
+    files   = [e for e in entries if e["type"] == "file"]
     kb = []
-    if "\\" in decoded and decoded not in ("C:\\","D:\\","E:\\"):
-        parent = decoded.rsplit("\\",1)[0]
-        if parent.endswith(":"): parent += "\\"
-        kb.append([InlineKeyboardButton("⬆️ ..", callback_data=f"browse:{urllib.parse.quote(parent,safe='')}|{uuid}")])
+    
+    if "\\" in decoded and decoded not in ("C:\\", "D:\\", "E:\\"):
+        parent = decoded.rsplit("\\", 1)[0]
+        if parent.endswith(":"):
+            parent += "\\"
+        kb.append([InlineKeyboardButton("⬆️ ..", callback_data=f"browse:{urllib.parse.quote(parent, safe='')}|{uuid}")])
     else:
         kb.append([InlineKeyboardButton("📁 Быстрые папки", callback_data=f"files|{uuid}")])
+    
     for e in folders[:18]:
         full = decoded.rstrip("\\") + "\\" + e["name"]
-        kb.append([InlineKeyboardButton(f"📁 {e['name']}", callback_data=f"browse:{urllib.parse.quote(full,safe='')}|{uuid}")])
+        kb.append([InlineKeyboardButton(f"📁 {e['name']}", callback_data=f"browse:{urllib.parse.quote(full, safe='')}|{uuid}")])
+    
     for e in files[:15]:
         full = decoded.rstrip("\\") + "\\" + e["name"]
-        sz = f" {e.get('size_kb',0)}KB" if e.get('size_kb',0)<10240 else f" {e.get('size_kb',0)//1024}MB"
+        sz = f" {e.get('size_kb', 0)}KB" if e.get('size_kb', 0) < 10240 else f" {e.get('size_kb', 0) // 1024}MB"
         kb.append([InlineKeyboardButton(f"{get_file_icon(e['name'])} {e['name']}{sz}",
-            callback_data=f"dlfile:{urllib.parse.quote(full,safe='')}|{uuid}")])
-    short = decoded[-40:] if len(decoded)>40 else decoded
+            callback_data=f"dlfile:{urllib.parse.quote(full, safe='')}|{uuid}")])
+    
+    short = decoded[-40:] if len(decoded) > 40 else decoded
     await query.edit_message_text(f"📁 `{short}`\n📂 {len(folders)} папок  📄 {len(files)} файлов",
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
-# ══════════════════════════════════════════════
-#  АВТО-СКРИНШОТЫ
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+//  АВТО-СКРИНШОТЫ
+# ══════════════════════════════════════════════════
 async def auto_screenshot_loop(uuid, interval_min=30):
+    """Цикл автоматических скриншотов"""
     chat_id = devices[uuid]["chat_id"]
-    while True:
-        await asyncio.sleep(interval_min * 60)
-        if uuid not in autoscr_tasks or uuid not in devices:
-            break
-        commands[uuid] = {"cmd": "screenshot_silent", "time": time.time()}
+    try:
+        while uuid in autoscr_tasks:
+            await asyncio.sleep(interval_min * 60)
+            if uuid not in autoscr_tasks or uuid not in devices:
+                break
+            commands[uuid] = {"cmd": "screenshot_silent", "time": time.time()}
+    except asyncio.CancelledError:
+        pass
 
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 #  БОТ КОМАНДЫ
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда /start"""
     await update.message.reply_text(
         "🔐 *Face ID Protector Bot v5*\n\n"
         "/register UUID — привязать устройство\n"
@@ -198,13 +247,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/history UUID — история входов",
         parse_mode="Markdown")
 
-def generate_verify_code(length=16):
-    """Генерирует 16-символьный код верификации"""
-    chars = string.ascii_letters + string.digits
-    return ''.join(random.SystemRandom().choice(chars) for _ in range(length))
-
 async def register_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Старая команда — объясняем что теперь /connect"""
+    """Команда /register"""
     await update.message.reply_text(
         "ℹ️ Используй `/connect ТОКЕН`\n\n"
         "Токен берётся из приложения FaceID Protector\n"
@@ -212,7 +256,7 @@ async def register_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown")
 
 async def connect_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Привязка через одноразовый токен из приложения"""
+    """Привязка через одноразовый токен"""
     chat_id = update.effective_chat.id
     if not ctx.args:
         await update.message.reply_text(
@@ -225,21 +269,20 @@ async def connect_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "⚠️ Токен действует **5 минут** и только **1 раз**",
             parse_mode="Markdown")
         return
+    
     token = ctx.args[0].strip()
     if len(token) != 16:
         await update.message.reply_text("❌ Токен должен быть ровно 16 символов.")
         return
 
-    # Проверяем что токен не использован
     if token in used_tokens:
         await update.message.reply_text("❌ Этот токен уже использован.")
         return
 
-    # Ищем pending запись по токену
     found_uuid = None
     for uuid, p in list(pending.items()):
         if p.get("token") == token:
-            if time.time() - p["time"] > 300:  # 5 минут
+            if time.time() - p["time"] > 300:
                 del pending[uuid]
                 await update.message.reply_text("⌛ Токен истёк. Нажми кнопку в приложении снова.")
                 return
@@ -255,11 +298,10 @@ async def connect_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "• FaceID Protector запущен")
         return
 
-    # Генерируем 16-символьный код верификации
     verify_code = generate_verify_code(16)
     pending[found_uuid]["verify_code"] = verify_code
     pending[found_uuid]["chat_id"] = chat_id
-    used_tokens.add(token)  # Помечаем токен как использованный
+    used_tokens.add(token)
     await save_data()
 
     await update.message.reply_text(
@@ -271,183 +313,219 @@ async def connect_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown")
 
 async def devices_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда /devices"""
     chat_id = update.effective_chat.id
-    my = [(u,d) for u,d in devices.items() if d.get("chat_id")==chat_id]
+    my = [(u, d) for u, d in devices.items() if d.get("chat_id") == chat_id]
     if not my:
-        await update.message.reply_text("Нет устройств.\n/register UUID"); return
+        await update.message.reply_text("Нет устройств.\n/register UUID")
+        return
     txt = "📱 *Ваши устройства:*\n\n"
-    for u,d in my:
-        txt += f"• `{u[:8]}...` — {d.get('name','ПК')}\n"
+    for u, d in my:
+        txt += f"• `{u[:8]}...` — {d.get('name', 'ПК')}\n"
     await update.message.reply_text(txt, parse_mode="Markdown")
 
 async def control_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда /control"""
     chat_id = update.effective_chat.id
-    my = [(u,d) for u,d in devices.items() if d.get("chat_id")==chat_id]
+    my = [(u, d) for u, d in devices.items() if d.get("chat_id") == chat_id]
     if not my:
-        await update.message.reply_text("Нет устройств. /register UUID"); return
-    if len(my)==1:
-        uuid,d = my[0]
+        await update.message.reply_text("Нет устройств. /register UUID")
+        return
+    if len(my) == 1:
+        uuid, d = my[0]
         await update.message.reply_text(
-            f"🖥️ *{d.get('name','ПК')}*", parse_mode="Markdown",
+            f"🖥️ *{d.get('name', 'ПК')}*", parse_mode="Markdown",
             reply_markup=main_keyboard(uuid))
     else:
-        kb = [[InlineKeyboardButton(d.get("name",u[:8]), callback_data=f"select|{u}")] for u,d in my]
+        kb = [[InlineKeyboardButton(d.get("name", u[:8]), callback_data=f"select|{u}")] for u, d in my]
         await update.message.reply_text("Выбери устройство:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def getfile_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if len(ctx.args)<2:
-        await update.message.reply_text("❌ /getfile UUID путь"); return
+    """Команда /getfile"""
+    if len(ctx.args) < 2:
+        await update.message.reply_text("❌ /getfile UUID путь")
+        return
     dev_uuid, filepath = ctx.args[0].strip(), " ".join(ctx.args[1:]).strip()
     chat_id = update.effective_chat.id
-    if dev_uuid not in devices or devices[dev_uuid].get("chat_id")!=chat_id:
-        await update.message.reply_text("❌ Устройство не найдено."); return
+    if dev_uuid not in devices or devices[dev_uuid].get("chat_id") != chat_id:
+        await update.message.reply_text("❌ Устройство не найдено.")
+        return
     commands[dev_uuid] = {"cmd": f"sendfile:{filepath}", "time": time.time()}
     await update.message.reply_text(f"📁 Запрашиваю `{filepath}`", parse_mode="Markdown")
 
 async def search_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if len(ctx.args)<2:
-        await update.message.reply_text("❌ /search UUID запрос"); return
+    """Команда /search"""
+    if len(ctx.args) < 2:
+        await update.message.reply_text("❌ /search UUID запрос")
+        return
     dev_uuid, query_str = ctx.args[0].strip(), " ".join(ctx.args[1:]).strip()
     chat_id = update.effective_chat.id
-    if dev_uuid not in devices or devices[dev_uuid].get("chat_id")!=chat_id:
-        await update.message.reply_text("❌ Устройство не найдено."); return
+    if dev_uuid not in devices or devices[dev_uuid].get("chat_id") != chat_id:
+        await update.message.reply_text("❌ Устройство не найдено.")
+        return
     commands[dev_uuid] = {"cmd": f"searchfiles:{query_str}", "time": time.time()}
     await update.message.reply_text(f"🔍 Ищу `{query_str}`...", parse_mode="Markdown")
 
 async def history_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда /history"""
     if not ctx.args:
-        await update.message.reply_text("❌ /history UUID"); return
+        await update.message.reply_text("❌ /history UUID")
+        return
     dev_uuid = ctx.args[0].strip()
     chat_id = update.effective_chat.id
-    if dev_uuid not in devices or devices[dev_uuid].get("chat_id")!=chat_id:
-        await update.message.reply_text("❌ Устройство не найдено."); return
+    if dev_uuid not in devices or devices[dev_uuid].get("chat_id") != chat_id:
+        await update.message.reply_text("❌ Устройство не найдено.")
+        return
     hist = login_history.get(dev_uuid, [])
     if not hist:
-        await update.message.reply_text("📋 История входов пуста."); return
+        await update.message.reply_text("📋 История входов пуста.")
+        return
     txt = "📋 *История входов:*\n\n"
     for h in hist[-10:]:
         icon = "✅" if h["success"] else "❌"
-        txt += f"{icon} {h['time']} — {h.get('user','?')}\n"
+        txt += f"{icon} {h['time']} — {h.get('user', '?')}\n"
     await update.message.reply_text(txt, parse_mode="Markdown")
 
-# Обработка файлов от пользователя (загрузка на ПК)
 async def file_upload_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обработка загруженных файлов"""
     chat_id = update.effective_chat.id
-    my = [(u,d) for u,d in devices.items() if d.get("chat_id")==chat_id]
+    my = [(u, d) for u, d in devices.items() if d.get("chat_id") == chat_id]
     if not my:
-        await update.message.reply_text("❌ Нет привязанных устройств."); return
-    if len(my)>1:
-        await update.message.reply_text("❌ Укажи устройство через /control"); return
+        await update.message.reply_text("❌ Нет привязанных устройств.")
+        return
+    if len(my) > 1:
+        await update.message.reply_text("❌ Укажи устройство через /control")
+        return
     uuid = my[0][0]
     doc = update.message.document or (update.message.photo[-1] if update.message.photo else None)
     if not doc:
-        await update.message.reply_text("❌ Файл не найден."); return
-    fname = getattr(doc, 'file_name', 'upload.jpg') if hasattr(doc,'file_name') else 'photo.jpg'
+        await update.message.reply_text("❌ Файл не найден.")
+        return
+    fname = getattr(doc, 'file_name', 'upload.jpg') if hasattr(doc, 'file_name') else 'photo.jpg'
     msg = await update.message.reply_text(f"📤 Загружаю `{fname}` на ПК...", parse_mode="Markdown")
     file = await doc.get_file()
     data = await file.download_as_bytearray()
     b64 = base64.b64encode(data).decode()
     commands[uuid] = {"cmd": f"receivefile:{fname}:{b64}", "time": time.time()}
 
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 #  КНОПКИ
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок"""
     query   = update.callback_query
     await query.answer()
     data    = query.data
     chat_id = query.from_user.id
-    if "|" not in data: return
+    
+    if "|" not in data:
+        return
+    
     cmd, uuid = data.split("|", 1)
 
     # Удаление
     if cmd == "delete_confirm":
-        name = devices.get(uuid,{}).get("name","ПК")
+        name = devices.get(uuid, {}).get("name", "ПК")
         await query.edit_message_text(
             f"🗑 *Удалить устройство?*\n\n`{uuid[:8]}...` — {name}",
-            parse_mode="Markdown", reply_markup=confirm_delete_keyboard(uuid)); return
+            parse_mode="Markdown", reply_markup=confirm_delete_keyboard(uuid))
+        return
+    
     if cmd == "delete_yes":
-        if uuid in devices and devices[uuid].get("chat_id")==chat_id:
-            del devices[uuid]; await save_data()
+        if uuid in devices and devices[uuid].get("chat_id") == chat_id:
+            del devices[uuid]
+            await save_data()
             await query.edit_message_text("✅ Устройство удалено.")
         else:
-            await query.edit_message_text("❌ Нет доступа."); return
+            await query.edit_message_text("❌ Нет доступа.")
+        return
 
     if cmd.startswith("select"):
-        name = devices.get(uuid,{}).get("name","ПК")
+        name = devices.get(uuid, {}).get("name", "ПК")
         await query.edit_message_text(f"🖥️ *{name}*", parse_mode="Markdown",
-            reply_markup=main_keyboard(uuid)); return
+            reply_markup=main_keyboard(uuid))
+        return
 
-    if uuid not in devices or devices[uuid].get("chat_id")!=chat_id:
-        await query.answer("❌ Нет доступа", show_alert=True); return
+    if uuid not in devices or devices[uuid].get("chat_id") != chat_id:
+        await query.answer("❌ Нет доступа", show_alert=True)
+        return
 
     # Файловый менеджер
-    if cmd=="files":
-        await show_file_browser(query, uuid, "root"); return
+    if cmd == "files":
+        await show_file_browser(query, uuid, "root")
+        return
+    
     if cmd.startswith("browse:"):
-        await show_file_browser(query, uuid, cmd[7:]); return
+        await show_file_browser(query, uuid, cmd[7:])
+        return
+    
     if cmd.startswith("dlfile:"):
         filepath = urllib.parse.unquote(cmd[7:])
         commands[uuid] = {"cmd": f"sendfile:{filepath}", "time": time.time()}
-        name = filepath.rsplit("\\",1)[-1]
+        name = filepath.rsplit("\\", 1)[-1]
         await query.edit_message_text(f"📥 Скачиваю `{name}`...", parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"files|{uuid}")]])); return
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"files|{uuid}")]]))
+        return
 
     # Поиск файлов
-    if cmd=="searchfiles":
+    if cmd == "searchfiles":
         await query.edit_message_text(
             "🔍 *Поиск файлов*\n\nОтправь название файла:",
             parse_mode="Markdown", reply_markup=back_keyboard(uuid))
-        ctx.user_data["waiting_search"] = uuid; return
+        ctx.user_data["waiting_search"] = uuid
+        return
 
     # История входов
-    if cmd=="history":
+    if cmd == "history":
         hist = login_history.get(uuid, [])
         if not hist:
-            await query.edit_message_text("📋 История входов пуста.", reply_markup=back_keyboard(uuid)); return
+            await query.edit_message_text("📋 История входов пуста.", reply_markup=back_keyboard(uuid))
+            return
         txt = "📋 *История входов:*\n\n"
         for h in hist[-10:]:
             icon = "✅" if h["success"] else "❌"
-            txt += f"{icon} {h['time']} — {h.get('user','?')}\n"
-        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=back_keyboard(uuid)); return
+            txt += f"{icon} {h['time']} — {h.get('user', '?')}\n"
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=back_keyboard(uuid))
+        return
 
     # Процессы
-    if cmd=="processes":
+    if cmd == "processes":
         commands[uuid] = {"cmd": "getprocesses", "time": time.time()}
-        await query.edit_message_text("💻 Загружаю процессы...", reply_markup=back_keyboard(uuid)); return
-    if cmd.startswith("killproc:"):
-        pid = cmd[9:]
-        commands[uuid] = {"cmd": f"killprocess:{pid}", "time": time.time()}
-        await query.answer(f"💀 Завершаю PID {pid}..."); return
+        await query.edit_message_text("💻 Загружаю процессы...", reply_markup=back_keyboard(uuid))
+        return
 
     # Аудио
-    if cmd=="audio":
+    if cmd == "audio":
         commands[uuid] = {"cmd": "recordaudio:15", "time": time.time()}
-        await query.edit_message_text("🎙 Запись 15 сек...", reply_markup=back_keyboard(uuid)); return
+        await query.edit_message_text("🎙 Запись 15 сек...", reply_markup=back_keyboard(uuid))
+        return
 
     # ПАНИКА
-    if cmd=="panic":
+    if cmd == "panic":
         commands[uuid] = {"cmd": "panic", "time": time.time()}
         await query.edit_message_text(
             "🚨 *РЕЖИМ ПАНИКИ АКТИВИРОВАН*\n\n🔒 Блокировка\n📸 Серия фото\n🔊 Сирена",
-            parse_mode="Markdown", reply_markup=back_keyboard(uuid)); return
+            parse_mode="Markdown", reply_markup=back_keyboard(uuid))
+        return
 
     # USB
-    if cmd=="usb_toggle":
+    if cmd == "usb_toggle":
         action = "usb_unblock" if usb_blocked.get(uuid) else "usb_block"
         usb_blocked[uuid] = not usb_blocked.get(uuid, False)
         commands[uuid] = {"cmd": action, "time": time.time()}
         label = "разблокированы" if not usb_blocked[uuid] else "заблокированы"
-        await query.edit_message_text(f"🔌 USB {label}", reply_markup=back_keyboard(uuid)); return
+        await query.edit_message_text(f"🔌 USB {label}", reply_markup=back_keyboard(uuid))
+        return
 
     # Сон / Гибернация
-    if cmd in ("sleep","hibernate"):
+    if cmd in ("sleep", "hibernate"):
         commands[uuid] = {"cmd": cmd, "time": time.time()}
-        label = "😴 ПК уходит в сон..." if cmd=="sleep" else "❄️ ПК уходит в гибернацию..."
-        await query.edit_message_text(label, reply_markup=back_keyboard(uuid)); return
+        label = "😴 ПК уходит в сон..." if cmd == "sleep" else "❄️ ПК уходит в гибернацию..."
+        await query.edit_message_text(label, reply_markup=back_keyboard(uuid))
+        return
 
     # Авто-скриншоты
-    if cmd=="autoscr":
+    if cmd == "autoscr":
         if uuid in autoscr_tasks:
             autoscr_tasks[uuid].cancel()
             del autoscr_tasks[uuid]
@@ -459,38 +537,46 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # Приложения
-    if cmd=="listapps":
+    if cmd == "listapps":
         commands[uuid] = {"cmd": "listapps", "time": time.time()}
-        await query.edit_message_text("📱 Загружаю...", reply_markup=back_keyboard(uuid)); return
+        await query.edit_message_text("📱 Загружаю...", reply_markup=back_keyboard(uuid))
+        return
+    
     if cmd.startswith("launchapp:"):
         commands[uuid] = {"cmd": cmd, "time": time.time()}
-        await query.answer("▶️ Запускаю..."); return
+        await query.answer("▶️ Запускаю...")
+        return
 
     # FaceID запуск
-    if cmd=="launch_faceid":
+    if cmd == "launch_faceid":
         commands[uuid] = {"cmd": "launch_faceid", "time": time.time()}
-        await query.edit_message_text("🚀 Запускаю FaceID Protector...", reply_markup=back_keyboard(uuid)); return
+        await query.edit_message_text("🚀 Запускаю FaceID Protector...", reply_markup=back_keyboard(uuid))
+        return
 
     # Остальные команды
     cmd_names = {
-        "screenshot":"📸 Скриншот...", "camera":"📷 Камера...",
-        "lock":"🔒 Блокирую...", "reboot":"🔄 Перезагружаю...",
-        "shutdown":"⏻ Выключаю...", "stream":"🎥 Эфир...",
-        "faceid":"🔐 Face ID...", "status":"📊 Статус...",
+        "screenshot": "📸 Скриншот...",
+        "camera": "📷 Камера...",
+        "lock": "🔒 Блокирую...",
+        "reboot": "🔄 Перезагружаю...",
+        "shutdown": "⏻ Выключаю...",
+        "stream": "🎥 Эфир...",
+        "faceid": "🔐 Face ID...",
+        "status": "📊 Статус...",
     }
     commands[uuid] = {"cmd": cmd, "time": time.time()}
-    await query.edit_message_text(cmd_names.get(cmd,"Команда отправлена..."),
+    await query.edit_message_text(cmd_names.get(cmd, "Команда отправлена..."),
         reply_markup=back_keyboard(uuid))
 
 async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Обработка текста — поиск файлов, 2FA коды"""
+    """Обработка текста"""
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
 
     # 2FA проверка
     for uuid, tfa in list(tfa_codes.items()):
-        if tfa["chat_id"]==chat_id and tfa["code"]==text:
-            if time.time()-tfa["time"]<300:
+        if tfa["chat_id"] == chat_id and tfa["code"] == text:
+            if time.time() - tfa["time"] < 300:
                 commands[uuid] = {"cmd": "tfa_ok", "time": time.time()}
                 del tfa_codes[uuid]
                 await update.message.reply_text("✅ Код принят! Доступ разрешён.", reply_markup=main_keyboard(uuid))
@@ -503,45 +589,45 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Поиск файлов
     if "waiting_search" in ctx.user_data:
         uuid = ctx.user_data.pop("waiting_search")
-        if uuid in devices and devices[uuid].get("chat_id")==chat_id:
+        if uuid in devices and devices[uuid].get("chat_id") == chat_id:
             commands[uuid] = {"cmd": f"searchfiles:{text}", "time": time.time()}
             await update.message.reply_text(f"🔍 Ищу `{text}` на ПК...", parse_mode="Markdown")
 
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 #  HTTP API
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 async def api_verify(request):
-    try: data = await request.json()
-    except: return web.json_response({"ok":False,"error":"bad_json"})
-    dev_uuid = data.get("uuid","")
-    token    = data.get("token","")
-    code     = data.get("code","")
+    """API: Проверка кода подтверждения"""
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"ok": False, "error": "bad_json"})
+    
+    dev_uuid = data.get("uuid", "")
+    token    = data.get("token", "")
+    code     = data.get("code", "")
 
     if not dev_uuid or not token or not code:
-        return web.json_response({"ok":False,"error":"missing_fields"})
+        return web.json_response({"ok": False, "error": "missing_fields"})
 
-    # Проверяем что UUID существует в pending
     if dev_uuid not in pending:
-        return web.json_response({"ok":False,"error":"not_found"})
+        return web.json_response({"ok": False, "error": "not_found"})
 
     p = pending[dev_uuid]
 
-    # Проверяем токен
     if p.get("token") != token:
-        return web.json_response({"ok":False,"error":"wrong_token"})
+        return web.json_response({"ok": False, "error": "wrong_token"})
 
-    # Проверяем время (5 минут)
     if time.time() - p["time"] > 300:
-        del pending[dev_uuid]; await save_data()
-        return web.json_response({"ok":False,"error":"expired"})
+        del pending[dev_uuid]
+        await save_data()
+        return web.json_response({"ok": False, "error": "expired"})
 
-    # Проверяем код верификации (16 символов)
-    if p.get("verify_code","") != code:
-        return web.json_response({"ok":False,"error":"wrong_code"})
+    if p.get("verify_code", "") != code:
+        return web.json_response({"ok": False, "error": "wrong_code"})
 
-    # Всё верно — привязываем
     chat_id = p["chat_id"]
-    devices[dev_uuid] = {"chat_id": chat_id, "name": data.get("name","ПК")}
+    devices[dev_uuid] = {"chat_id": chat_id, "name": data.get("name", "ПК")}
     del pending[dev_uuid]
     used_tokens.add(token)
     await save_data()
@@ -551,38 +637,49 @@ async def api_verify(request):
         f"ID: `{dev_uuid[:8]}...`\n\n"
         f"🔒 Токен уничтожен\n/control",
         parse_mode="Markdown")
-    return web.json_response({"ok":True})
+    
+    logger.info(f"Device registered: {dev_uuid[:8]}...")
+    return web.json_response({"ok": True})
 
 async def api_alert(request):
-    try: data = await request.json()
-    except: return web.json_response({"ok":False})
-    dev_uuid = data.get("uuid","")
+    """API: Алерт о попытке входа"""
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"ok": False})
+    
+    dev_uuid = data.get("uuid", "")
     if dev_uuid not in devices:
-        return web.json_response({"ok":False,"error":"device_not_found"})
+        return web.json_response({"ok": False, "error": "device_not_found"})
+    
     chat_id = devices[dev_uuid]["chat_id"]
     ts = data.get("time", datetime.now().strftime("%H:%M:%S %d.%m.%Y"))
-    attempts = data.get("attempts",1)
+    attempts = data.get("attempts", 1)
 
     # История входов
-    if dev_uuid not in login_history: login_history[dev_uuid]=[]
+    if dev_uuid not in login_history:
+        login_history[dev_uuid] = []
     login_history[dev_uuid].append({
         "time": ts, "success": False, "user": "Unknown", "attempts": attempts
     })
-    if len(login_history[dev_uuid])>100: login_history[dev_uuid]=login_history[dev_uuid][-100:]
+    if len(login_history[dev_uuid]) > 100:
+        login_history[dev_uuid] = login_history[dev_uuid][-100:]
 
     await bot_app.bot.send_message(chat_id,
         f"🚨 *ПОПЫТКА ВХОДА*\n\n🕐 {ts}\n❌ Попыток: {attempts}",
         parse_mode="Markdown")
+    
     if data.get("camera"):
         await bot_app.bot.send_photo(chat_id, photo=base64.b64decode(data["camera"]),
             caption="📸 Фото злоумышленника")
+    
     if data.get("screenshot"):
         await bot_app.bot.send_photo(chat_id, photo=base64.b64decode(data["screenshot"]),
             caption="🖥️ Скриншот экрана")
 
-    # 2FA — отправить код если много попыток
+    # 2FA
     if attempts >= 2:
-        code = str(random.randint(100000,999999))
+        code = str(random.randint(100000, 999999))
         tfa_codes[dev_uuid] = {"code": code, "chat_id": chat_id, "time": time.time()}
         await bot_app.bot.send_message(chat_id,
             f"🔐 *2FA КОД ДЛЯ ВХОДА*\n\n`{code}`\n\n"
@@ -590,108 +687,145 @@ async def api_alert(request):
             parse_mode="Markdown")
         commands[dev_uuid] = {"cmd": f"tfa_send:{code}", "time": time.time()}
 
-    return web.json_response({"ok":True})
+    logger.warning(f"Failed login attempt for {dev_uuid[:8]}... - {attempts} attempts")
+    return web.json_response({"ok": True})
 
 async def api_login_success(request):
-    """ПК сообщает об успешном входе"""
-    try: data = await request.json()
-    except: return web.json_response({"ok":False})
-    dev_uuid = data.get("uuid","")
-    if dev_uuid not in devices: return web.json_response({"ok":False})
+    """API: Успешный вход"""
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"ok": False})
+    
+    dev_uuid = data.get("uuid", "")
+    if dev_uuid not in devices:
+        return web.json_response({"ok": False})
+    
     ts = datetime.now().strftime("%H:%M:%S %d.%m.%Y")
-    if dev_uuid not in login_history: login_history[dev_uuid]=[]
+    if dev_uuid not in login_history:
+        login_history[dev_uuid] = []
     login_history[dev_uuid].append({
-        "time": ts, "success": True, "user": data.get("user","?")
+        "time": ts, "success": True, "user": data.get("user", "?")
     })
-    return web.json_response({"ok":True})
+    
+    logger.info(f"Successful login for {dev_uuid[:8]}...")
+    return web.json_response({"ok": True})
 
 async def api_poll(request):
-    try: data = await request.json()
-    except: return web.json_response({"cmd":None})
-    dev_uuid = data.get("uuid","")
+    """API: Получение команд"""
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"cmd": None})
+    
+    dev_uuid = data.get("uuid", "")
     if dev_uuid not in commands:
-        return web.json_response({"cmd":None})
+        return web.json_response({"cmd": None})
+    
     cmd = commands.pop(dev_uuid)
-    if time.time()-cmd["time"]>30:
-        return web.json_response({"cmd":None})
+    if time.time() - cmd["time"] > 30:
+        return web.json_response({"cmd": None})
+    
+    logger.debug(f"Sent command to {dev_uuid[:8]}...: {cmd['cmd'][:50]}")
     return web.json_response({"cmd": cmd["cmd"]})
 
 async def api_result(request):
-    try: data = await request.json()
-    except: return web.json_response({"ok":False})
-    dev_uuid = data.get("uuid","")
-    if dev_uuid not in devices: return web.json_response({"ok":False})
+    """API: Получение результатов"""
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"ok": False})
+    
+    dev_uuid = data.get("uuid", "")
+    if dev_uuid not in devices:
+        return web.json_response({"ok": False})
+    
     chat_id = devices[dev_uuid]["chat_id"]
-    cmd = data.get("cmd","")
+    cmd = data.get("cmd", "")
 
-    if cmd in ("screenshot","screenshot_silent","stream_frame"):
+    logger.debug(f"Result from {dev_uuid[:8]}...: {cmd}")
+
+    if cmd in ("screenshot", "screenshot_silent", "stream_frame"):
         if data.get("image"):
-            if dev_uuid not in last_images: last_images[dev_uuid]={}
+            if dev_uuid not in last_images:
+                last_images[dev_uuid] = {}
             last_images[dev_uuid]["screenshot"] = data["image"]
             # WebSocket рассылка
             if dev_uuid in ws_clients:
                 dead = set()
                 for ws in ws_clients[dev_uuid]:
-                    try: await ws.send_str(json.dumps({"type":"frame","image":data["image"]}))
-                    except: dead.add(ws)
+                    try:
+                        await ws.send_str(json.dumps({"type": "frame", "image": data["image"]}))
+                    except:
+                        dead.add(ws)
                 ws_clients[dev_uuid] -= dead
-            if cmd=="screenshot":
+            if cmd == "screenshot":
                 await bot_app.bot.send_photo(chat_id, photo=base64.b64decode(data["image"]),
                     caption="📸 Скриншот", reply_markup=main_keyboard(dev_uuid))
-            elif cmd=="screenshot_silent":
+            elif cmd == "screenshot_silent":
                 await bot_app.bot.send_photo(chat_id, photo=base64.b64decode(data["image"]),
                     caption=f"🤖 Авто-скриншот {datetime.now().strftime('%H:%M')}")
 
-    elif cmd=="camera":
+    elif cmd == "camera":
         if data.get("image"):
-            if dev_uuid not in last_images: last_images[dev_uuid]={}
+            if dev_uuid not in last_images:
+                last_images[dev_uuid] = {}
             last_images[dev_uuid]["camera"] = data["image"]
             if dev_uuid in ws_clients:
                 dead = set()
                 for ws in ws_clients[dev_uuid]:
-                    try: await ws.send_str(json.dumps({"type":"camera","image":data["image"]}))
-                    except: dead.add(ws)
+                    try:
+                        await ws.send_str(json.dumps({"type": "camera", "image": data["image"]}))
+                    except:
+                        dead.add(ws)
                 ws_clients[dev_uuid] -= dead
             await bot_app.bot.send_photo(chat_id, photo=base64.b64decode(data["image"]),
                 caption="📷 Камера", reply_markup=main_keyboard(dev_uuid))
 
-    elif cmd=="locked":
+    elif cmd == "locked":
         await bot_app.bot.send_message(chat_id, "🔒 ПК заблокирован", reply_markup=main_keyboard(dev_uuid))
 
-    elif cmd=="listdir":
+    elif cmd == "listdir":
         file_results[dev_uuid] = data
 
-    elif cmd=="file":
+    elif cmd == "file":
         if data.get("image"):
-            fname = data.get("filename","file.bin")
+            fname = data.get("filename", "file.bin")
             await bot_app.bot.send_document(chat_id,
                 document=base64.b64decode(data["image"]), filename=fname, caption=f"📁 {fname}")
 
-    elif cmd=="file_error":
-        errs = {"no_path":"Путь не указан","not_found":"Файл не найден","too_large":"Файл >50MB"}
-        await bot_app.bot.send_message(chat_id, f"❌ {errs.get(data.get('error',''),data.get('error','?'))}")
+    elif cmd == "file_error":
+        errs = {
+            "no_path": "Путь не указан",
+            "not_found": "Файл не найден",
+            "too_large": "Файл >50MB"
+        }
+        await bot_app.bot.send_message(chat_id,
+            f"❌ {errs.get(data.get('error', ''), data.get('error', '?'))}")
 
-    elif cmd=="apps_list":
-        apps = data.get("apps",[])
+    elif cmd == "apps_list":
+        apps = data.get("apps", [])
         if not apps:
-            await bot_app.bot.send_message(chat_id, "📱 Нет приложений."); return web.json_response({"ok":True})
+            await bot_app.bot.send_message(chat_id, "📱 Нет приложений.")
+            return web.json_response({"ok": True})
         kb = [[InlineKeyboardButton(f"▶️ {a['name']}", callback_data=f"launchapp:{a['idx']}|{dev_uuid}")] for a in apps]
         kb.append([InlineKeyboardButton("◀️ Назад", callback_data=f"select|{dev_uuid}")])
         await bot_app.bot.send_message(chat_id, "📱 *Приложения:*",
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
-    elif cmd=="app_launched":
-        await bot_app.bot.send_message(chat_id, f"▶️ Запущено: *{data.get('name','?')}*",
+    elif cmd == "app_launched":
+        await bot_app.bot.send_message(chat_id, f"▶️ Запущено: *{data.get('name', '?')}*",
             parse_mode="Markdown", reply_markup=main_keyboard(dev_uuid))
 
-    elif cmd=="faceid_launched":
+    elif cmd == "faceid_launched":
         await bot_app.bot.send_message(chat_id, "🚀 FaceID Protector запущен!", reply_markup=main_keyboard(dev_uuid))
 
-    elif cmd=="processes_list":
-        procs = data.get("processes",[])
+    elif cmd == "processes_list":
+        procs = data.get("processes", [])
         process_list[dev_uuid] = procs
         if not procs:
-            await bot_app.bot.send_message(chat_id, "💻 Нет процессов."); return web.json_response({"ok":True})
+            await bot_app.bot.send_message(chat_id, "💻 Нет процессов.")
+            return web.json_response({"ok": True})
         kb = []
         for p in procs[:20]:
             kb.append([InlineKeyboardButton(
@@ -702,127 +836,166 @@ async def api_result(request):
             f"💻 *Процессы ({len(procs)}):*",
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
-    elif cmd=="process_killed":
+    elif cmd == "process_killed":
         await bot_app.bot.send_message(chat_id,
-            f"💀 Процесс {data.get('pid','?')} завершён.", reply_markup=main_keyboard(dev_uuid))
+            f"💀 Процесс {data.get('pid', '?')} завершён.", reply_markup=main_keyboard(dev_uuid))
 
-    elif cmd=="audio":
+    elif cmd == "audio":
         if data.get("audio"):
             await bot_app.bot.send_audio(chat_id,
                 audio=base64.b64decode(data["audio"]),
                 filename="mic_record.wav", caption="🎙 Запись микрофона",
                 reply_markup=main_keyboard(dev_uuid))
 
-    elif cmd=="search_results":
-        results = data.get("results",[])
+    elif cmd == "search_results":
+        results = data.get("results", [])
         if not results:
             await bot_app.bot.send_message(chat_id, "🔍 Ничего не найдено.", reply_markup=main_keyboard(dev_uuid))
-            return web.json_response({"ok":True})
+            return web.json_response({"ok": True})
         txt = f"🔍 *Найдено {len(results)} файлов:*\n\n"
         kb = []
         for r in results[:15]:
             txt += f"📄 `{r['path'][-50:]}`\n"
-            safe = urllib.parse.quote(r['path'],safe='')
+            safe = urllib.parse.quote(r['path'], safe='')
             kb.append([InlineKeyboardButton(f"📥 {r['name']}", callback_data=f"dlfile:{safe}|{dev_uuid}")])
         kb.append([InlineKeyboardButton("◀️ Назад", callback_data=f"select|{dev_uuid}")])
         await bot_app.bot.send_message(chat_id, txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
-    elif cmd=="panic_done":
+    elif cmd == "panic_done":
         await bot_app.bot.send_message(chat_id, "🚨 ПАНИКА выполнена!\n🔒 Заблокировано\n📸 Фото сделаны",
             reply_markup=main_keyboard(dev_uuid))
         if data.get("photos"):
             for ph in data["photos"]:
                 await bot_app.bot.send_photo(chat_id, photo=base64.b64decode(ph), caption="📸 Паника")
 
-    elif cmd=="sysmon":
-        s = data.get("sysmon",{})
+    elif cmd == "sysmon":
+        s = data.get("sysmon", {})
         sysmon_data[dev_uuid] = {**s, "time": time.time()}
         # Рассылаем в WebSocket
         if dev_uuid in ws_clients:
             dead = set()
             for ws in ws_clients[dev_uuid]:
-                try: await ws.send_str(json.dumps({"type":"sysmon","data":s}))
-                except: dead.add(ws)
+                try:
+                    await ws.send_str(json.dumps({"type": "sysmon", "data": s}))
+                except:
+                    dead.add(ws)
             ws_clients[dev_uuid] -= dead
 
-    elif cmd=="status":
-        s = data.get("status",{})
+    elif cmd == "status":
+        s = data.get("status", {})
         await bot_app.bot.send_message(chat_id,
-            f"📊 *Статус ПК*\n\n🖥️ {s.get('hostname','?')}\n👤 {s.get('user','?')}\n"
+            f"📊 *Статус ПК*\n\n🖥️ {s.get('hostname', '?')}\n👤 {s.get('user', '?')}\n"
             f"🔒 {'Заблокирован' if s.get('locked') else 'Разблокирован'}\n"
-            f"💾 CPU: {s.get('cpu','?')}%  RAM: {s.get('ram','?')}%\n"
+            f"💾 CPU: {s.get('cpu', '?')}%  RAM: {s.get('ram', '?')}%\n"
             f"🕐 {datetime.now().strftime('%H:%M:%S')}",
             parse_mode="Markdown", reply_markup=main_keyboard(dev_uuid))
 
-    elif cmd=="file_received":
+    elif cmd == "file_received":
         await bot_app.bot.send_message(chat_id,
-            f"✅ Файл `{data.get('filename','?')}` сохранён на ПК", parse_mode="Markdown")
+            f"✅ Файл `{data.get('filename', '?')}` сохранён на ПК", parse_mode="Markdown")
 
-    return web.json_response({"ok":True})
+    return web.json_response({"ok": True})
 
 async def api_check(request):
-    try: data = await request.json()
-    except: return web.json_response({"registered":False})
-    return web.json_response({"registered": data.get("uuid","") in devices})
+    """API: Проверка регистрации"""
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"registered": False})
+    return web.json_response({"registered": data.get("uuid", "") in devices})
 
 async def api_connect_token(request):
-    """ПК регистрирует одноразовый токен для подключения"""
-    try: data = await request.json()
-    except: return web.json_response({"ok":False})
-    dev_uuid = data.get("uuid","")
-    token    = data.get("token","")
-    name     = data.get("name","ПК")
-    if not dev_uuid or not token or len(dev_uuid)<32 or len(token)!=16:
-        return web.json_response({"ok":False,"error":"invalid"})
-    # Сохраняем токен в pending (без chat_id — добавится когда юзер напишет /connect)
+    """API: Регистрация одноразового токена"""
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"ok": False})
+    
+    dev_uuid = data.get("uuid", "")
+    token    = data.get("token", "")
+    name     = data.get("name", "ПК")
+    
+    if not dev_uuid or not token or len(dev_uuid) < 32 or len(token) != 16:
+        return web.json_response({"ok": False, "error": "invalid"})
+    
     pending[dev_uuid] = {"token": token, "name": name, "time": time.time()}
     await save_data()
-    return web.json_response({"ok":True})
+    
+    logger.info(f"Token registered for device: {dev_uuid[:8]}...")
+    return web.json_response({"ok": True})
 
 async def api_webcmd(request):
-    try: data = await request.json()
-    except: return web.json_response({"ok":False})
-    dev_uuid, cmd = data.get("uuid",""), data.get("cmd","")
-    if dev_uuid not in devices: return web.json_response({"ok":False,"error":"not_found"})
+    """API: Команда из веб-панели"""
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"ok": False})
+    
+    dev_uuid, cmd = data.get("uuid", ""), data.get("cmd", "")
+    if dev_uuid not in devices:
+        return web.json_response({"ok": False, "error": "not_found"})
+    
     commands[dev_uuid] = {"cmd": cmd, "time": time.time()}
-    return web.json_response({"ok":True})
+    return web.json_response({"ok": True})
 
 async def api_webresult(request):
-    uuid  = request.match_info.get("uuid","")
-    itype = request.match_info.get("type","screenshot")
-    imgs  = last_images.get(uuid,{})
+    """API: Получение изображения для веб-панели"""
+    uuid  = request.match_info.get("uuid", "")
+    itype = request.match_info.get("type", "screenshot")
+    imgs  = last_images.get(uuid, {})
     if itype in imgs:
         img = imgs.pop(itype)
         return web.json_response({"image": img})
     return web.json_response({"image": None})
 
 async def api_sysmon(request):
-    """Возвращает последние данные мониторинга"""
-    uuid = request.match_info.get("uuid","")
-    return web.json_response(sysmon_data.get(uuid,{}))
+    """API: Данные мониторинга"""
+    uuid = request.match_info.get("uuid", "")
+    return web.json_response(sysmon_data.get(uuid, {}))
 
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 #  WEBSOCKET
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 async def ws_stream(request):
-    uuid = request.match_info.get("uuid","")
-    if uuid not in devices: return web.Response(status=403)
+    """WebSocket для прямого эфира"""
+    uuid = request.match_info.get("uuid", "")
+    if uuid not in devices:
+        return web.Response(status=403)
+    
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    if uuid not in ws_clients: ws_clients[uuid] = set()
+    
+    if uuid not in ws_clients:
+        ws_clients[uuid] = set()
     ws_clients[uuid].add(ws)
+    
+    logger.info(f"WebSocket connected for {uuid[:8]}... - {len(ws_clients[uuid])} clients")
+    
     try:
-        async for msg in ws: pass
+        async for msg in ws:
+            pass
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
     finally:
-        if uuid in ws_clients: ws_clients[uuid].discard(ws)
+        if uuid in ws_clients:
+            ws_clients[uuid].discard(ws)
+            logger.info(f"WebSocket disconnected for {uuid[:8]}... - {len(ws_clients[uuid])} clients left")
+    
     return ws
 
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 #  ВЕБ-ПАНЕЛЬ
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 async def web_panel(request):
-    uuid = request.match_info.get("uuid","")
-    if uuid not in devices: return web.Response(text="Device not found", status=404)
+    """HTML веб-панель"""
+    uuid = request.match_info.get("uuid", "")
+    if uuid not in devices:
+        return web.Response(text="Device not found", status=404)
+    
+    # Определяем протокол корректно
+    proto = "wss" if request.secure else "ws"
+    host = request.host
+    
     html = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -944,7 +1117,9 @@ body{{background:#050810;color:#c8d8e8;min-height:100vh}}
 
 <script>
 const UUID = '{uuid}';
-const WS_URL = `wss://${{location.host}}/ws/${{UUID}}`;
+const PROTO = '{proto}';
+const HOST = '{host}';
+const WS_URL = PROTO + '://' + HOST + '/ws/' + UUID;
 let ws=null, streamActive=false, streamInterval=null;
 let frameCount=0, fps=0, lastFpsTime=Date.now();
 let usbBlocked=false;
@@ -955,6 +1130,8 @@ function log(msg){{
   el.innerHTML+=`[${{t}}] ${{msg}}<br>`;
   el.scrollTop=el.scrollHeight;
 }}
+
+log('🌐 WebSocket URL: ' + WS_URL);
 
 async function sendCmd(cmd){{
   try{{
@@ -968,7 +1145,6 @@ async function sendCmd(cmd){{
 
 function takeScreenshot(){{
   sendCmd('screenshot');
-  setTimeout(pollImg,'screenshot',3000);
   setTimeout(()=>pollImg('screenshot'),3000);
 }}
 
@@ -1007,7 +1183,13 @@ function toggleStream(){{
 function connectWS(){{
   try{{
     ws=new WebSocket(WS_URL);
-    ws.onopen=()=>log('🔗 WS подключён');
+    ws.onopen=()=>{{
+      log('🔗 WebSocket подключен: '+WS_URL);
+    }};
+    ws.onerror=(e)=>{{
+      log('✗ WebSocket ошибка: '+e.type);
+      log('💡 Проверь что сервер работает');
+    }};
     ws.onmessage=(e)=>{{
       const d=JSON.parse(e.data);
       if(d.type==='frame'&&d.image){{
@@ -1023,8 +1205,13 @@ function connectWS(){{
         updateSysmon(d.data);
       }}
     }};
-    ws.onclose=()=>{{log('🔌 WS отключён');if(streamActive)setTimeout(connectWS,2000);}};
-  }}catch(e){{log('✗ WS: '+e)}}
+    ws.onclose=()=>{{
+      log('🔌 WebSocket отключен');
+      if(streamActive)setTimeout(connectWS,2000);
+    }};
+  }}catch(e){{
+    log('✗ WebSocket ошибка: '+e.message);
+  }}
 }}
 
 function updateSysmon(data){{
@@ -1062,23 +1249,25 @@ function toggleUsb(){{
 
 // Авто-обновление мониторинга
 setInterval(()=>sendCmd('status'),15000);
-connectWS();
 log('🌐 Панель загружена');
 </script>
 </body>
 </html>"""
+    
     return web.Response(text=html, content_type='text/html')
 
 async def healthcheck(request):
-    return web.Response(text=f"FaceID Bot v5 | devices:{len(devices)}")
+    """Health check endpoint"""
+    return web.Response(text=f"FaceID Bot v5 | devices:{len(devices)} | pending:{len(pending)}")
 
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 #  ЗАПУСК
-# ══════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 bot_app = None
 
 async def main():
     global bot_app
+    
     bot_app = Application.builder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("start",    start))
     bot_app.add_handler(CommandHandler("register", register_cmd))
@@ -1096,12 +1285,15 @@ async def main():
     loaded = await load_data_remote()
     devices = loaded.get("devices", {})
     pending = loaded.get("pending", {})
-    logging.info(f"Loaded {len(devices)} devices")
-
+    
+    logger.info("Bot initialization started")
     await bot_app.initialize()
     await bot_app.start()
     await bot_app.updater.start_polling(drop_pending_updates=True)
+    
+    logger.info("Bot started successfully, listening for updates")
 
+    # HTTP сервер
     http = web.Application()
     http.router.add_get("/",                            healthcheck)
     http.router.add_get("/panel/{uuid}",                web_panel)
@@ -1120,9 +1312,15 @@ async def main():
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(http)
     await runner.setup()
-    await web.TCPSite(runner,"0.0.0.0",port).start()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    
+    logger.info(f"HTTP server running on port {port}")
     print(f"✅ FaceID Bot v5 running on port {port}")
+    
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
