@@ -12,7 +12,7 @@ Face ID Protector Bot v5
 + Мониторинг CPU/RAM в веб-панели
 + WebSocket прямой эфир
 """
-import os, json, asyncio, logging, base64, random, time, urllib.parse
+import os, json, asyncio, logging, base64, random, time, urllib.parse, string
 from datetime import datetime
 from aiohttp import web
 import aiohttp as aiohttp_lib
@@ -55,6 +55,7 @@ async def save_data():
         logging.error(f"Save error: {e}")
 
 devices       = {}
+used_tokens   = set()  # одноразовые токены (in-memory)
 pending       = {}
 commands      = {}
 file_results  = {}
@@ -197,22 +198,76 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/history UUID — история входов",
         parse_mode="Markdown")
 
+def generate_verify_code(length=16):
+    """Генерирует 16-символьный код верификации"""
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.SystemRandom().choice(chars) for _ in range(length))
+
 async def register_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Старая команда — объясняем что теперь /connect"""
+    await update.message.reply_text(
+        "ℹ️ Используй `/connect ТОКЕН`\n\n"
+        "Токен берётся из приложения FaceID Protector\n"
+        "(кнопка ✈️ Telegram → одноразовый токен)",
+        parse_mode="Markdown")
+
+async def connect_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Привязка через одноразовый токен из приложения"""
     chat_id = update.effective_chat.id
     if not ctx.args:
         await update.message.reply_text(
             "📱 *Привязка устройства*\n\n"
             "1️⃣ Открой FaceID Protector\n"
-            "2️⃣ Нажми ✈️ Telegram\n"
-            "3️⃣ Скопируй UUID\n"
-            "4️⃣ `/register ВАШ-UUID`", parse_mode="Markdown")
+            "2️⃣ Нажми ✈️ *Telegram*\n"
+            "3️⃣ Скопируй **одноразовый токен** (16 символов)\n"
+            "4️⃣ Отправь сюда:\n\n"
+            "`/connect ВАШ-ТОКЕН`\n\n"
+            "⚠️ Токен действует **5 минут** и только **1 раз**",
+            parse_mode="Markdown")
         return
-    dev_uuid = ctx.args[0].strip()
-    code     = str(random.randint(100000, 999999))
-    pending[dev_uuid] = {"chat_id": chat_id, "code": code, "time": time.time()}
+    token = ctx.args[0].strip()
+    if len(token) != 16:
+        await update.message.reply_text("❌ Токен должен быть ровно 16 символов.")
+        return
+
+    # Проверяем что токен не использован
+    if token in used_tokens:
+        await update.message.reply_text("❌ Этот токен уже использован.")
+        return
+
+    # Ищем pending запись по токену
+    found_uuid = None
+    for uuid, p in list(pending.items()):
+        if p.get("token") == token:
+            if time.time() - p["time"] > 300:  # 5 минут
+                del pending[uuid]
+                await update.message.reply_text("⌛ Токен истёк. Нажми кнопку в приложении снова.")
+                return
+            found_uuid = uuid
+            break
+
+    if not found_uuid:
+        await update.message.reply_text(
+            "❌ Токен не найден.\n\n"
+            "Убедись что:\n"
+            "• Токен скопирован правильно\n"
+            "• Прошло не более 5 минут\n"
+            "• FaceID Protector запущен")
+        return
+
+    # Генерируем 16-символьный код верификации
+    verify_code = generate_verify_code(16)
+    pending[found_uuid]["verify_code"] = verify_code
+    pending[found_uuid]["chat_id"] = chat_id
+    used_tokens.add(token)  # Помечаем токен как использованный
     await save_data()
+
     await update.message.reply_text(
-        f"📱 UUID: `{dev_uuid[:8]}...`\n\nКод для приложения:\n🔑 *{code}*\n\n⏱ 10 минут",
+        f"📱 *Устройство найдено!*\n\n"
+        f"Введи этот код в приложении FaceID Protector:\n\n"
+        f"🔑 `{verify_code}`\n\n"
+        f"⏱ Код действует **5 минут**\n"
+        f"🔒 Одноразовый — после ввода удалится",
         parse_mode="Markdown")
 
 async def devices_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -458,20 +513,43 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def api_verify(request):
     try: data = await request.json()
     except: return web.json_response({"ok":False,"error":"bad_json"})
-    dev_uuid, code = data.get("uuid",""), data.get("code","")
+    dev_uuid = data.get("uuid","")
+    token    = data.get("token","")
+    code     = data.get("code","")
+
+    if not dev_uuid or not token or not code:
+        return web.json_response({"ok":False,"error":"missing_fields"})
+
+    # Проверяем что UUID существует в pending
     if dev_uuid not in pending:
         return web.json_response({"ok":False,"error":"not_found"})
+
     p = pending[dev_uuid]
-    if time.time()-p["time"]>600:
+
+    # Проверяем токен
+    if p.get("token") != token:
+        return web.json_response({"ok":False,"error":"wrong_token"})
+
+    # Проверяем время (5 минут)
+    if time.time() - p["time"] > 300:
         del pending[dev_uuid]; await save_data()
         return web.json_response({"ok":False,"error":"expired"})
-    if p["code"]!=code:
+
+    # Проверяем код верификации (16 символов)
+    if p.get("verify_code","") != code:
         return web.json_response({"ok":False,"error":"wrong_code"})
-    devices[dev_uuid] = {"chat_id": p["chat_id"], "name": data.get("name","ПК")}
+
+    # Всё верно — привязываем
+    chat_id = p["chat_id"]
+    devices[dev_uuid] = {"chat_id": chat_id, "name": data.get("name","ПК")}
     del pending[dev_uuid]
+    used_tokens.add(token)
     await save_data()
-    await bot_app.bot.send_message(p["chat_id"],
-        f"✅ *Устройство привязано!*\nUUID: `{dev_uuid[:8]}...`\n\n/control",
+
+    await bot_app.bot.send_message(chat_id,
+        f"✅ *Устройство привязано!*\n"
+        f"ID: `{dev_uuid[:8]}...`\n\n"
+        f"🔒 Токен уничтожен\n/control",
         parse_mode="Markdown")
     return web.json_response({"ok":True})
 
@@ -686,6 +764,20 @@ async def api_check(request):
     try: data = await request.json()
     except: return web.json_response({"registered":False})
     return web.json_response({"registered": data.get("uuid","") in devices})
+
+async def api_connect_token(request):
+    """ПК регистрирует одноразовый токен для подключения"""
+    try: data = await request.json()
+    except: return web.json_response({"ok":False})
+    dev_uuid = data.get("uuid","")
+    token    = data.get("token","")
+    name     = data.get("name","ПК")
+    if not dev_uuid or not token or len(dev_uuid)<32 or len(token)!=16:
+        return web.json_response({"ok":False,"error":"invalid"})
+    # Сохраняем токен в pending (без chat_id — добавится когда юзер напишет /connect)
+    pending[dev_uuid] = {"token": token, "name": name, "time": time.time()}
+    await save_data()
+    return web.json_response({"ok":True})
 
 async def api_webcmd(request):
     try: data = await request.json()
@@ -990,6 +1082,7 @@ async def main():
     bot_app = Application.builder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("start",    start))
     bot_app.add_handler(CommandHandler("register", register_cmd))
+    bot_app.add_handler(CommandHandler("connect",  connect_cmd))
     bot_app.add_handler(CommandHandler("devices",  devices_cmd))
     bot_app.add_handler(CommandHandler("control",  control_cmd))
     bot_app.add_handler(CommandHandler("getfile",  getfile_cmd))
@@ -1018,6 +1111,7 @@ async def main():
     http.router.add_post("/api/poll",                   api_poll)
     http.router.add_post("/api/result",                 api_result)
     http.router.add_post("/api/check",                  api_check)
+    http.router.add_post("/api/connect_token",          api_connect_token)
     http.router.add_post("/api/webcmd",                 api_webcmd)
     http.router.add_post("/api/login_success",          api_login_success)
     http.router.add_get("/api/webresult/{uuid}/{type}", api_webresult)
