@@ -218,7 +218,7 @@ async def show_file_browser(query, uuid, path):
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 # ══════════════════════════════════════════════════
-//  АВТО-СКРИНШОТЫ
+#  АВТО-СКРИНШОТЫ
 # ══════════════════════════════════════════════════
 async def auto_screenshot_loop(uuid, interval_min=30):
     """Цикл автоматических скриншотов"""
@@ -1247,7 +1247,7 @@ function toggleUsb(){{
     usbBlocked?'🔌 USB разблокировать':'🔌 USB заблокировать';
 }}
 
-// Авто-обновление мониторинга
+# Авто-обновление мониторинга
 setInterval(()=>sendCmd('status'),15000);
 log('🌐 Панель загружена');
 </script>
@@ -1324,4 +1324,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Shutting down...")
-        
