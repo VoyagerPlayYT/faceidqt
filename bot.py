@@ -258,19 +258,22 @@ async def register_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def connect_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Привязка через одноразовый токен"""
     chat_id = update.effective_chat.id
-    if not ctx.args:
+    # If token provided as argument - process it
+    if ctx.args:
+        token = ctx.args[0].strip()
+    else:
+        # Ask user to just type the token
+        ctx.user_data["waiting_token"] = True
         await update.message.reply_text(
             "📱 *Привязка устройства*\n\n"
             "1️⃣ Открой FaceID Protector\n"
             "2️⃣ Нажми ✈️ *Telegram*\n"
-            "3️⃣ Скопируй **одноразовый токен** (16 символов)\n"
-            "4️⃣ Отправь сюда:\n\n"
-            "`/connect ВАШ-ТОКЕН`\n\n"
-            "⚠️ Токен действует **5 минут** и только **1 раз**",
+            "3️⃣ Скопируй токен (16 символов)\n"
+            "4️⃣ Просто отправь токен сюда\n\n"
+            "⏳ Жду токен...",
             parse_mode="Markdown")
         return
-    
-    token = ctx.args[0].strip()
+    token = token
     if len(token) != 16:
         await update.message.reply_text("❌ Токен должен быть ровно 16 символов.")
         return
@@ -327,11 +330,11 @@ async def devices_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def control_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Команда /control"""
     chat_id = update.effective_chat.id
-    logger.info(f"/control from chat_id={chat_id}, devices={list(devices.keys())[:3]}")
+    logger.info(f"/control from chat_id={chat_id}, total_devices={len(devices)}")
     my = [(u, d) for u, d in devices.items() if int(d.get("chat_id", 0)) == int(chat_id)]
-    logger.info(f"/control found {len(my)} devices for this chat")
+    logger.info(f"/control found {len(my)} devices for this chat: {[u[:8] for u,d in my]}")
     if not my:
-        await update.message.reply_text("Нет устройств. /register UUID")
+        await update.message.reply_text("Нет устройств. Используй /connect ТОКЕН")
         return
     if len(my) == 1:
         uuid, d = my[0]
@@ -339,8 +342,36 @@ async def control_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🖥️ *{d.get('name', 'ПК')}*", parse_mode="Markdown",
             reply_markup=main_keyboard(uuid))
     else:
-        kb = [[InlineKeyboardButton(d.get("name", u[:8]), callback_data=f"select|{u}")] for u, d in my]
-        await update.message.reply_text("Выбери устройство:", reply_markup=InlineKeyboardMarkup(kb))
+        kb = []
+        for u, d in my:
+            kb.append([InlineKeyboardButton(f"🖥️ {d.get('name','ПК')} ({u[:8]})", callback_data=f"select|{u}")])
+        kb.append([InlineKeyboardButton("🗑 Удалить все старые", callback_data=f"deleteall|{chat_id}")])
+        await update.message.reply_text(
+            f"📱 Найдено {len(my)} устройств. Выбери:",
+            reply_markup=InlineKeyboardMarkup(kb))
+
+async def delete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда /delete UUID - удалить устройство"""
+    chat_id = update.effective_chat.id
+    if not ctx.args:
+        my = [(u, d) for u, d in devices.items() if int(d.get("chat_id", 0)) == int(chat_id)]
+        if not my:
+            await update.message.reply_text("Нет устройств.")
+            return
+        txt = "Используй:
+"
+        for u, d in my:
+            txt += f"`/delete {u}`
+"
+        await update.message.reply_text(txt, parse_mode="Markdown")
+        return
+    uuid = ctx.args[0].strip()
+    if uuid in devices and int(devices[uuid].get("chat_id", 0)) == int(chat_id):
+        del devices[uuid]
+        await save_data()
+        await update.message.reply_text(f"✅ Устройство `{uuid[:8]}...` удалено.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Устройство не найдено.")
 
 async def getfile_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Команда /getfile"""
@@ -440,6 +471,18 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("✅ Устройство удалено.")
         else:
             await query.edit_message_text("❌ Нет доступа.")
+        return
+
+    if cmd == "deleteall":
+        # uuid here is actually chat_id
+        cid = int(uuid)
+        to_delete = [u for u,d in devices.items() if int(d.get("chat_id",0))==cid]
+        # Keep only the most recent one
+        if len(to_delete) > 1:
+            for u in to_delete[:-1]:
+                del devices[u]
+            await save_data()
+            await query.edit_message_text(f"✅ Удалено {len(to_delete)-1} старых устройств.")
         return
 
     if cmd.startswith("select"):
@@ -577,7 +620,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # 2FA проверка
     for uuid, tfa in list(tfa_codes.items()):
-        if tfa["chat_id"] == chat_id and tfa["code"] == text:
+        if int(tfa["chat_id"]) == int(chat_id) and tfa["code"] == text:
             if time.time() - tfa["time"] < 300:
                 commands[uuid] = {"cmd": "tfa_ok", "time": time.time()}
                 del tfa_codes[uuid]
@@ -588,10 +631,45 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⌛ Код устарел.")
                 return
 
+    # Ожидание токена подключения
+    if ctx.user_data.get("waiting_token"):
+        ctx.user_data.pop("waiting_token")
+        token = text
+        if len(token) != 16:
+            await update.message.reply_text("❌ Токен должен быть 16 символов. Попробуй снова /connect")
+            return
+        if token in used_tokens:
+            await update.message.reply_text("❌ Этот токен уже использован.")
+            return
+        found_uuid = None
+        for uuid, p in list(pending.items()):
+            if p.get("token") == token:
+                if time.time() - p["time"] > 300:
+                    del pending[uuid]
+                    await update.message.reply_text("⌛ Токен истёк. Нажми кнопку в приложении снова.")
+                    return
+                found_uuid = uuid
+                break
+        if not found_uuid:
+            await update.message.reply_text("❌ Токен не найден. Убедись что FaceID Protector запущен и токен свежий.")
+            return
+        verify_code = generate_verify_code(16)
+        pending[found_uuid]["verify_code"] = verify_code
+        pending[found_uuid]["chat_id"] = int(chat_id)
+        used_tokens.add(token)
+        await save_data()
+        await update.message.reply_text(
+            f"✅ *Устройство найдено!*\n\n"
+            f"Введи этот код в приложении FaceID Protector:\n\n"
+            f"🔑 `{verify_code}`\n\n"
+            f"⏱ Действует 5 минут",
+            parse_mode="Markdown")
+        return
+
     # Поиск файлов
     if "waiting_search" in ctx.user_data:
         uuid = ctx.user_data.pop("waiting_search")
-        if uuid in devices and devices[uuid].get("chat_id") == chat_id:
+        if uuid in devices and int(devices[uuid].get("chat_id",0)) == int(chat_id):
             commands[uuid] = {"cmd": f"searchfiles:{text}", "time": time.time()}
             await update.message.reply_text(f"🔍 Ищу `{text}` на ПК...", parse_mode="Markdown")
 
@@ -1280,6 +1358,7 @@ async def main():
     bot_app.add_handler(CommandHandler("getfile",  getfile_cmd))
     bot_app.add_handler(CommandHandler("search",   search_cmd))
     bot_app.add_handler(CommandHandler("history",  history_cmd))
+    bot_app.add_handler(CommandHandler("delete",   delete_cmd))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
     bot_app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, file_upload_handler))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
