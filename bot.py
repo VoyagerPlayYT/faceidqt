@@ -218,7 +218,7 @@ async def show_file_browser(query, uuid, path):
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 # ══════════════════════════════════════════════════
-#  АВТО-СКРИНШОТЫ
+//  АВТО-СКРИНШОТЫ
 # ══════════════════════════════════════════════════
 async def auto_screenshot_loop(uuid, interval_min=30):
     """Цикл автоматических скриншотов"""
@@ -315,7 +315,7 @@ async def connect_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def devices_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Команда /devices"""
     chat_id = update.effective_chat.id
-    my = [(u, d) for u, d in devices.items() if d.get("chat_id") == chat_id]
+    my = [(u, d) for u, d in devices.items() if int(d.get("chat_id", 0)) == int(chat_id)]
     if not my:
         await update.message.reply_text("Нет устройств.\n/register UUID")
         return
@@ -327,7 +327,9 @@ async def devices_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def control_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Команда /control"""
     chat_id = update.effective_chat.id
-    my = [(u, d) for u, d in devices.items() if d.get("chat_id") == chat_id]
+    logger.info(f"/control from chat_id={chat_id}, devices={list(devices.keys())[:3]}")
+    my = [(u, d) for u, d in devices.items() if int(d.get("chat_id", 0)) == int(chat_id)]
+    logger.info(f"/control found {len(my)} devices for this chat")
     if not my:
         await update.message.reply_text("Нет устройств. /register UUID")
         return
@@ -389,7 +391,7 @@ async def history_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def file_upload_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Обработка загруженных файлов"""
     chat_id = update.effective_chat.id
-    my = [(u, d) for u, d in devices.items() if d.get("chat_id") == chat_id]
+    my = [(u, d) for u, d in devices.items() if int(d.get("chat_id", 0)) == int(chat_id)]
     if not my:
         await update.message.reply_text("❌ Нет привязанных устройств.")
         return
@@ -627,7 +629,7 @@ async def api_verify(request):
         return web.json_response({"ok": False, "error": "wrong_code"})
 
     chat_id = p["chat_id"]
-    devices[dev_uuid] = {"chat_id": chat_id, "name": data.get("name", "ПК")}
+    devices[dev_uuid] = {"chat_id": int(chat_id), "name": data.get("name", "ПК")}
     del pending[dev_uuid]
     used_tokens.add(token)
     await save_data()
@@ -719,6 +721,7 @@ async def api_poll(request):
         return web.json_response({"cmd": None})
     
     dev_uuid = data.get("uuid", "")
+    logger.info(f"POLL from {dev_uuid[:8] if dev_uuid else '?'}, has_cmd={dev_uuid in commands}")
     if dev_uuid not in commands:
         return web.json_response({"cmd": None})
     
@@ -1247,7 +1250,7 @@ function toggleUsb(){{
     usbBlocked?'🔌 USB разблокировать':'🔌 USB заблокировать';
 }}
 
-# Авто-обновление мониторинга
+// Авто-обновление мониторинга
 setInterval(()=>sendCmd('status'),15000);
 log('🌐 Панель загружена');
 </script>
