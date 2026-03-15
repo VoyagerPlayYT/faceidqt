@@ -33,8 +33,10 @@ def decode_uuid(encoded):
         pos = CUSTOM_CHARS.find(c)
         if pos != -1:
             result += HEX_CHARS[pos]
-    if len(result) == 32:
-        return f"{result[0:8]}-{result[8:12]}-{result[12:16]}-{result[16:20]}-{result[20:32]}"
+    # Take first 32 hex chars = UUID without dashes
+    hex32 = result[:32]
+    if len(hex32) == 32:
+        return f"{hex32[0:8]}-{hex32[8:12]}-{hex32[12:16]}-{hex32[16:20]}-{hex32[20:32]}"
     return result
 
 def encode_uuid(uuid):
@@ -218,7 +220,7 @@ async def register_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     encoded = ctx.args[0].strip()
     # Decode to real UUID
     real_uuid = decode_uuid(encoded)
-    if len(real_uuid.replace('-','')) != 32:
+    if len(real_uuid.replace('-','')) < 32:
         await update.message.reply_text("❌ Неверный код устройства.")
         return
     # Generate 6-digit code
